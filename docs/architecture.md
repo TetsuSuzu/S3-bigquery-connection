@@ -1,13 +1,32 @@
 # アーキテクチャ詳細
 
-## ⚠️ 最重要の前提：WAV は直接 BigQuery に入らない
+## 前提：音声は「文字起こし」を経て分析する（ただし BigQuery 内でも可能）
 
-BigQuery は**構造化データ/テキストを分析する**サービスで、**生の音声(WAV)は分析できない**。
-したがってどの構成でも必ず
+**訂正（重要）**: 当初「WAV は BigQuery で分析できない」と記したが、これは不正確。
+BigQuery は **オブジェクトテーブル(Object tables / BigLake)** で GCS 上の非構造化ファイル（音声・画像・PDF）を
+参照でき、**`ML.TRANSCRIBE`**（裏で Cloud Speech-to-Text）や **`ML.GENERATE_TEXT` / `AI.GENERATE`（マルチモーダル）**
+などの AI 関数で、**SQL から音声を文字起こし・分析できる**。
 
-> 音声(WAV) → 文字起こし(テキスト/JSON) → BigQuery
+正確には次のとおり:
 
-という**文字起こし(transcription)ステップ**が入る。設計の分岐点は「**文字起こしを AWS 側でやるか GCP 側でやるか**」。
+- ❌ raw WAV を「通常のテーブル列」としてそのまま分析することはできない
+- ✅ **オブジェクトテーブル + `ML.TRANSCRIBE` 等の AI 関数**で、BigQuery 内から音声を文字起こし・分析できる
+
+つまりどの構成でも「音声 → テキスト化」は必須だが、**そのステップを外部パイプラインで行うか(案A/B)、
+BigQuery 自身が SQL で行うか(案C)** が設計の分岐点。
+
+> S3 との関係: オブジェクトテーブルは **GCS 上のファイルが対象**。S3 の WAV を直接は参照できないため、
+> 案C でも **S3 → GCS への転送(Storage Transfer Service)は必要**。BigQuery Omni(AWS/S3 の in-place クエリ)は
+> 構造化データ向けで、object table + `ML.TRANSCRIBE` のフル機能は GCS 前提と考えるのが安全。
+
+BigQuery が提供する主な非構造化/AI 関数:
+
+| 仕組み | 用途 |
+|--------|------|
+| オブジェクトテーブル(Object tables/BigLake) | GCS の非構造化ファイル(音声/画像/PDF)をテーブル参照 |
+| `ML.TRANSCRIBE` | 音声を SQL から文字起こし(Cloud Speech-to-Text) |
+| `ML.GENERATE_TEXT` / `AI.GENERATE` | 音声/画像/文書を Gemini で要約・分類・抽出(マルチモーダル) |
+| `ML.PROCESS_DOCUMENT` / `ML.ANNOTATE_IMAGE` / `ML.UNDERSTAND_TEXT` / `ML.TRANSLATE` | 文書処理 / 画像認識 / NLP / 翻訳 |
 
 ---
 
@@ -79,6 +98,30 @@ S3 (WAV) ──Storage Transfer Service──▶ GCS (WAV)
 
 ---
 
+## 案C（BigQuery ネイティブ）：オブジェクトテーブル + `ML.TRANSCRIBE`
+
+外部の Cloud Functions 等を使わず、**BigQuery の SQL だけで「音声 → 文字起こし → 分析」を完結**させる。
+最も "BigQuery らしい" 構成。
+
+```
+S3 (WAV) ──Storage Transfer Service──▶ GCS (WAV)
+                                          │
+                                          ▼
+                              BigQuery オブジェクトテーブル (音声参照)
+                                          │ ML.TRANSCRIBE (SQL)
+                                          ▼
+                              トランスクリプト列を持つテーブル
+                                          │ ML.GENERATE_TEXT / AI.GENERATE
+                                          ▼
+                              要約・感情・意図抽出 → 分析・可視化
+```
+
+- **メリット**: パイプラインが SQL に集約され運用がシンプル。Gemini でそのまま深い分析へ。
+- **デメリット**: 音声を GCS へ移す必要（越境コスト/PII は案 A より大）。対応リージョン・エディションの制約に注意。
+- 実装例: [examples/bigquery_unstructured.sql](../examples/bigquery_unstructured.sql)
+
+---
+
 ## クロスクラウドの認証・セキュリティ
 
 - **Storage Transfer Service / BigQuery Data Transfer**: AWS 側に**読み取り専用 IAM ロール/アクセスキー**。
@@ -99,15 +142,20 @@ S3 (WAV) ──Storage Transfer Service──▶ GCS (WAV)
 
 ---
 
-## まとめ：おすすめは案A
+## まとめ：3 案の比較
 
-| 観点 | 案A（AWS 文字起こし） | 案B（GCP 文字起こし） |
-|------|-----------------|-----------------|
-| 越境データ | **テキスト/JSON（軽い）** | 音声 WAV（重い） |
-| コスト | 低い | 高い（転送・保管） |
-| PII リスク | 低い（事前 redaction 可） | 高い |
-| Connect 親和性 | **高い（Contact Lens 統合）** | 低い |
+| 観点 | 案A（AWS 文字起こし） | 案B（GCP 自前文字起こし） | 案C（BigQuery ネイティブ） |
+|------|-----------------|-----------------|------------------|
+| 文字起こし場所 | AWS (Transcribe/Contact Lens) | GCP (Cloud Functions + Speech-to-Text) | **BigQuery SQL (`ML.TRANSCRIBE`)** |
+| 越境データ | **テキスト/JSON（軽い）** | 音声 WAV（重い） | 音声 WAV（重い） |
+| コスト | 低い | 高い | 中（転送あり/運用は軽い） |
+| PII リスク | **低い（事前 redaction 可）** | 高い | 高い |
+| Connect 親和性 | **高い（Contact Lens 統合）** | 低い | 低い |
+| 運用のシンプルさ | 中 | 低い | **高い（SQL に集約）** |
 
-**結論**: Amazon Connect → S3(WAV) → **Contact Lens/Transcribe でテキスト化＋PII 編集** →
-**BigQuery Data Transfer Service（または BigQuery Omni で in-place クエリ）** → BigQuery で分析、が
-コスト効率・セキュリティ・実装容易性のバランスで最良。
+**使い分け**
+- **越境コスト・PII を最小化したい / Contact Lens を活かす** → **案A**（AWS でテキスト化し軽量データのみ転送）。
+- **GCP に寄せて SQL だけで完結させたい / Gemini で深く分析したい** → **案C**（GCS に音声を集約し BigQuery ネイティブ）。
+- 案B は案C で代替できることが多く、Cloud Functions の作り込みが要る分だけ不利。
+
+コンタクトセンター用途で迷ったら、まず **案A**（コスト/PII 最小）、GCP 主導で分析を深めたいなら **案C** を推奨。

@@ -3,16 +3,18 @@
 > Amazon Connect の通話録音（S3 に保存された WAV ファイル）を GCP BigQuery へ渡して分析するための
 > クロスクラウド・アーキテクチャ設計ノート。
 
-## ⚠️ 最重要の前提
+## 前提：音声は「文字起こし」を経て分析（BigQuery 内でも可能）
 
-BigQuery は**構造化データ/テキストを分析する**サービスで、**生の音声(WAV)は直接分析できません**。
-どの構成でも必ず次のステップが入ります。
+音声(WAV)を「通常のテーブル列」として直接分析することはできませんが、**BigQuery は
+オブジェクトテーブル + `ML.TRANSCRIBE` / `AI.GENERATE` 等の AI 関数で、SQL から音声を
+文字起こし・分析できます**（非構造化データ対応）。
 
 ```
-音声(WAV) → 文字起こし(テキスト/JSON) → BigQuery
+音声(WAV) → 文字起こし(テキスト) → 分析
+            ↑ このステップを AWS / GCP自前 / BigQueryネイティブ のどれで行うかが分岐点
 ```
 
-設計の分岐点は「**文字起こしを AWS 側でやるか、GCP 側でやるか**」です。
+設計の分岐点は「**文字起こしを AWS 側(案A)・GCP 自前(案B)・BigQuery ネイティブ(案C)のどれで行うか**」です。
 
 ## 推奨構成（案A：AWS 側で文字起こし）
 
@@ -31,8 +33,9 @@ BigQuery テーブル → SQL / BigQuery ML / Gemini in BigQuery → Looker Stud
 
 ## ドキュメント
 
-- [アーキテクチャ詳細（案A/案B・転送方式比較・認証・分析）](./docs/architecture.md)
+- [アーキテクチャ詳細（案A/案B/案C・転送方式比較・認証・分析）](./docs/architecture.md)
 - [BigQuery 分析サンプル SQL（テーブル定義・集計・Gemini）](./examples/bigquery_analysis.sql)
+- [BigQuery ネイティブ 非構造化音声分析 SQL（オブジェクトテーブル + ML.TRANSCRIBE）](./examples/bigquery_unstructured.sql)
 - [データ転送方式の選び方](./docs/data_transfer_options.md)
 
 ## 関連
